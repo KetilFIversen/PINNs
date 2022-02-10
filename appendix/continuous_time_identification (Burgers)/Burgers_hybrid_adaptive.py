@@ -4,10 +4,8 @@
 
 import sys
 sys.path.insert(0, 'C:/Users/ketil/Desktop/UiB/Jobb/Publication/PINNs (Maziarraissi TF1)/PINNs/Utilities/')
+#sys.path.insert(0, '../../Utilities/')
 
-sys.path
-
-#%%
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,26 +16,39 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib.gridspec as gridspec
 import time
 
+import xarray as xr
+
 np.random.seed(1234)
 tf.set_random_seed(1234)
 
-
-#%%
 class PhysicsInformedNN:
     # Initialize the class
-    def __init__(self, X, u, layers, lb, ub):
+    def __init__(self, X_f, X_u, u, layers, lb, ub):
         
         self.lb = lb
         self.ub = ub
         
-        self.x = X[:,0:1]
-        self.t = X[:,1:2]
+        # Residual points
+        self.x_f = X_f[:,0:1]
+        self.t_f = X_f[:,1:2]
+        
+        # Supervised points
+        self.x_u = X_u[:,0:1]
+        self.t_u = X_u[:,1:2]
         self.u = u
         
+        # NN layers
         self.layers = layers
         
         # Initialize NNs
         self.weights, self.biases = self.initialize_NN(layers)
+        
+        # For custom NN
+        self.encoder_weights_1 = self.xavier_init([2, layers[1]])
+        self.encoder_biases_1 = self.xavier_init([1, layers[1]])
+        
+        self.encoder_weights_2 = self.xavier_init([2, layers[1]])
+        self.encoder_biases_2 = self.xavier_init([1, layers[1]])
         
         # tf placeholders and graph
         self.sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True,
@@ -47,16 +58,57 @@ class PhysicsInformedNN:
         self.lambda_1 = tf.Variable([0.0], dtype=tf.float32)
         self.lambda_2 = tf.Variable([-6.0], dtype=tf.float32)
         
-        self.x_tf = tf.placeholder(tf.float32, shape=[None, self.x.shape[1]])
-        self.t_tf = tf.placeholder(tf.float32, shape=[None, self.t.shape[1]])
+        # Residual points
+        self.x_f_tf = tf.placeholder(tf.float32, shape=[None, self.x_f.shape[1]])
+        self.t_f_tf = tf.placeholder(tf.float32, shape=[None, self.t_f.shape[1]])
+        
+        # Supervised points
+        self.x_u_tf = tf.placeholder(tf.float32, shape=[None, self.x_u.shape[1]])
+        self.t_u_tf = tf.placeholder(tf.float32, shape=[None, self.t_u.shape[1]])
         self.u_tf = tf.placeholder(tf.float32, shape=[None, self.u.shape[1]])
-                
-        self.u_pred = self.net_u(self.x_tf, self.t_tf)
-        self.f_pred = self.net_f(self.x_tf, self.t_tf)
+         
         
-        self.loss = tf.reduce_mean(tf.square(self.u_tf - self.u_pred)) + \
-                    tf.reduce_mean(tf.square(self.f_pred))
+        self.u_pred = self.net_u(self.x_u_tf, self.t_u_tf)
+        self.f_pred = self.net_f(self.x_f_tf, self.t_f_tf)
         
+        
+        # Adaptive constant
+        self.beta = 0.9
+        self.adaptive_constant_val = np.array(1.0)
+        self.adaptive_constant_tf = tf.placeholder(tf.float32, shape=self.adaptive_constant_val.shape)
+        
+        
+        # Loss
+        self.loss_res = tf.reduce_mean(tf.square(self.f_pred))
+        self.loss_bcs = self.adaptive_constant_tf * tf.reduce_mean(tf.square(self.u_tf - self.u_pred))
+        
+        self.loss = self.loss_res + self.loss_bcs
+        
+        
+        # Adaptive constant cont.
+        self.grad_res = []
+        self.grad_bcs = []
+        for i in range(len(self.layers) - 1):
+            self.grad_res.append(tf.gradients(self.loss_res, self.weights[i])[0])
+            self.grad_bcs.append(tf.gradients(self.loss_bcs, self.weights[i])[0])
+            
+        self.adaptive_constant_log = []
+        self.adaptive_constant_list = []
+        
+        self.max_grad_res_list = []
+        self.mean_grad_bcs_list = []
+        
+        for i in range(len(self.layers) - 1):
+            self.max_grad_res_list.append(tf.reduce_max(tf.abs(self.grad_res[i])))
+            self.mean_grad_bcs_list.append(tf.reduce_mean(tf.abs(self.grad_bcs[i])))
+            
+        self.max_grad_res = tf.reduce_max(tf.stack(self.max_grad_res_list))
+        self.mean_grad_bcs = tf.reduce_mean(tf.stack(self.mean_grad_bcs_list))
+        self.adaptive_constant = self.max_grad_res / self.mean_grad_bcs
+        
+        
+        # Lbfgs Optimizer
+        self.Lbfgs_iter = 0
         self.optimizer = tf.contrib.opt.ScipyOptimizerInterface(self.loss, 
                                                                 method = 'L-BFGS-B', 
                                                                 options = {'maxiter': 50000,
@@ -64,7 +116,7 @@ class PhysicsInformedNN:
                                                                            'maxcor': 50,
                                                                            'maxls': 50,
                                                                            'ftol' : 1.0 * np.finfo(float).eps})
-    
+        # ADAM Optimizer
         self.optimizer_Adam = tf.train.AdamOptimizer()
         self.train_op_Adam = self.optimizer_Adam.minimize(self.loss)
         
@@ -100,9 +152,27 @@ class PhysicsInformedNN:
         b = biases[-1]
         Y = tf.add(tf.matmul(H, W), b)
         return Y
+    
+    def forward_pass(self, H):
+        num_layers = len(self.layers)
+        encoder_1 = tf.tanh(tf.add(tf.matmul(H, self.encoder_weights_1), self.encoder_biases_1))
+        encoder_2 = tf.tanh(tf.add(tf.matmul(H, self.encoder_weights_2), self.encoder_biases_2))
+
+        for l in range(0, num_layers - 2):
+            W = self.weights[l]
+            b = self.biases[l]
+            H = tf.math.multiply(tf.tanh(tf.add(tf.matmul(H, W), b)), encoder_1) + \
+                tf.math.multiply(1 - tf.tanh(tf.add(tf.matmul(H, W), b)), encoder_2)
+
+        W = self.weights[-1]
+        b = self.biases[-1]
+        H = tf.add(tf.matmul(H, W), b)
+        return H
             
     def net_u(self, x, t):  
-        u = self.neural_net(tf.concat([x,t],1), self.weights, self.biases)
+        u = self.neural_net(tf.concat([x,t],1), self.weights, self.biases) # Normal NN
+        #u = self.forward_pass(tf.concat([x,t],1))                           # Custom NN
+        
         return u
     
     def net_f(self, x, t):
@@ -117,28 +187,37 @@ class PhysicsInformedNN:
         return f
     
     def callback(self, loss, lambda_1, lambda_2):
-        print('Loss: %e, l1: %.5f, l2: %.5f' % (loss, lambda_1, np.exp(lambda_2)))
-        
+        if self.Lbfgs_iter % 100 == 0:
+            print('LBFGS It: %d, Loss: %e, lambda_1: %.5f, lambda_2: %.5f' % (self.Lbfgs_iter, loss, lambda_1, np.exp(lambda_2)))
+        self.Lbfgs_iter += 1
         
     def train(self, nIter):
-        tf_dict = {self.x_tf: self.x, self.t_tf: self.t, self.u_tf: self.u}
+        tf_dict = {self.x_f_tf: self.x_f, self.t_f_tf: self.t_f,
+                   self.x_u_tf: self.x_u, self.t_u_tf: self.t_u, self.u_tf: self.u,
+                   self.adaptive_constant_tf: self.adaptive_constant_val}
         
+        if not nIter == 0:
+                print('Now optimizing with ADAM')
         
         start_time = time.time()
         for it in range(nIter):
             self.sess.run(self.train_op_Adam, tf_dict)
             
-            if it == 0:
-                print('Now optimizing with ADAM')
-            
             # Print
-            if it % 10 == 0:
+            if it % 100 == 0:
                 elapsed = time.time() - start_time
                 loss_value = self.sess.run(self.loss, tf_dict)
                 lambda_1_value = self.sess.run(self.lambda_1)
                 lambda_2_value = np.exp(self.sess.run(self.lambda_2))
-                print('It: %d, Loss: %.3e, Lambda_1: %.3f, Lambda_2: %.6f, Time: %.2f' % 
-                      (it, loss_value, lambda_1_value, lambda_2_value, elapsed))
+                
+                # Adaptive const
+                adaptive_constant_value = self.sess.run(self.adaptive_constant, tf_dict)
+                self.adaptive_constant_val = adaptive_constant_value * (1.0 - self.beta) \
+                                            + self.beta * self.adaptive_constant_val
+                self.adaptive_constant_log.append(self.adaptive_constant_val)
+                
+                print('ADAM It: %d, Loss: %.3e, Lambda_1: %.3f, Lambda_2: %.6f, Adaptive_const: %.2f, Time: %.2f' % 
+                      (it, loss_value, lambda_1_value, lambda_2_value, self.adaptive_constant_val, elapsed))
                 start_time = time.time()
         
         print('Now optimizing with L-BFGS')
@@ -150,19 +229,22 @@ class PhysicsInformedNN:
         
     def predict(self, X_star):
         
-        tf_dict = {self.x_tf: X_star[:,0:1], self.t_tf: X_star[:,1:2]}
+        tf_dict = {self.x_f_tf: X_star[:,0:1], self.t_f_tf: X_star[:,1:2], self.x_u_tf: X_star[:,0:1], self.t_u_tf: X_star[:,1:2]}
         
         u_star = self.sess.run(self.u_pred, tf_dict)
         f_star = self.sess.run(self.f_pred, tf_dict)
         
         return u_star, f_star
 
-#%%    
+   
 if __name__ == "__main__": 
      
     nu = 0.01/np.pi
-
-    N_u = 2000
+    
+    
+    N_u = 32
+    N_f = 25600 - N_u
+    
     layers = [2, 20, 20, 20, 20, 20, 20, 20, 20, 1]
     
     data = scipy.io.loadmat('../Data/burgers_shock.mat')
@@ -176,22 +258,63 @@ if __name__ == "__main__":
     X_star = np.hstack((X.flatten()[:,None], T.flatten()[:,None]))
     u_star = Exact.flatten()[:,None]              
 
-    # Doman bounds
+    # Domain bounds
     lb = X_star.min(0)
-    ub = X_star.max(0)    
+    ub = X_star.max(0) 
+    
+    idx_u = np.random.choice(X_star.shape[0], N_u, replace=False)
+    idx_f = np.random.choice(X_star.shape[0], N_f, replace=False)
+    idx_f = np.concatenate([idx_u, idx_f])
+    
+    X_u_train = X_star[idx_u,:]
+    u_train = u_star[idx_u,:]
+    
+    X_f_train = X_star[idx_f,:]
+    
+    # Select x,t
+#    tmp  = xr.DataArray(data = Exact, coords=[t[:,0],x[:,0]], dims=['t','x'])
+#    tmpX = xr.DataArray(data = X,     coords=[t[:,0],x[:,0]], dims=['t','x'])
+#    tmpT = xr.DataArray(data = T,     coords=[t[:,0],x[:,0]], dims=['t','x'])
+#    
+#    x_vals = [-0.8, -0.5, -0.2, -0.1, 0.1, 0.2, 0.5, 0.8]
+#    t_vals = [0.0, 0.25, 0.5, 0.75, 1.0]
+#    
+#    tmpnp  =  tmp.sel(x = x_vals, method='nearest').values.flatten()[:,None]
+#    tmpnpX = tmpX.sel(x = x_vals, method='nearest').values.flatten()
+#    tmpnpT = tmpT.sel(x = x_vals, method='nearest').values.flatten()
+#    
+##    tmpnp  =  tmp.sel(t = t_vals, method='nearest').values.flatten()[:,None]
+##    tmpnpX = tmpX.sel(t = t_vals, method='nearest').values.flatten()
+##    tmpnpT = tmpT.sel(t = t_vals, method='nearest').values.flatten()
+#    
+#    tmpnpXT = np.stack((tmpnpX,tmpnpT), axis=1)
+#    
+#    X_u_train = tmpnpXT
+#    u_train   = tmpnp
+    
+#    X_f_train = np.concatenate((X_u_train, X_f_train), axis=0)
+    
     
     #%%
+    
+    def unison_shuffle(a,b):
+        assert len(a) == len(b)
+        p = np.random.permutation(len(a))
+        return a[p], b[p]
+    
+    X_u_train, u_train = unison_shuffle(X_u_train, u_train)
+    np.random.shuffle(X_f_train)
+    
+    #%%
+    start_time = time.time()
     ######################################################################
-    ######################## Noiseles Data ###############################
+    ######################## Noiseless Data ###############################
     ######################################################################
     noise = 0.0            
-             
-    idx = np.random.choice(X_star.shape[0], N_u, replace=False)
-    X_u_train = X_star[idx,:]
-    u_train = u_star[idx,:]
     
-    model = PhysicsInformedNN(X_u_train, u_train, layers, lb, ub)
-    model.train(0)
+    print('Training model with {} residual points and {} supervised points'.format(X_f_train.shape[0], X_u_train.shape[0]))
+    model = PhysicsInformedNN(X_f_train, X_u_train, u_train, layers, lb, ub)
+    model.train(10000)
     
     u_pred, f_pred = model.predict(X_star)
             
@@ -207,17 +330,17 @@ if __name__ == "__main__":
     error_lambda_2 = np.abs(lambda_2_value - nu)/nu * 100
     
     print('Error u: %e' % (error_u))    
-    print('Error l1: %.5f%%' % (error_lambda_1))                             
-    print('Error l2: %.5f%%' % (error_lambda_2))  
+    print('Error lambda_1: %.5f%%' % (error_lambda_1))                             
+    print('Error lambda_2: %.5f%%' % (error_lambda_2))  
     
-    #%%
+    
     ######################################################################
     ########################### Noisy Data ###############################
     ######################################################################
     noise = 0.01        
     u_train = u_train + noise*np.std(u_train)*np.random.randn(u_train.shape[0], u_train.shape[1])
         
-    model = PhysicsInformedNN(X_u_train, u_train, layers, lb, ub)
+    model = PhysicsInformedNN(X_f_train, X_u_train, u_train, layers, lb, ub)
     model.train(10000)
     
     u_pred, f_pred = model.predict(X_star)
@@ -231,7 +354,9 @@ if __name__ == "__main__":
     
     print('Error lambda_1: %f%%' % (error_lambda_1_noisy))
     print('Error lambda_2: %f%%' % (error_lambda_2_noisy))                           
-
+    
+    print('Total training time was: {}s'.format(time.time()-start_time))
+    
     #%%
     ######################################################################
     ############################# Plotting ###############################

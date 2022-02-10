@@ -21,6 +21,7 @@ import matplotlib.gridspec as gridspec
 np.random.seed(1234)
 tf.set_random_seed(1234)
 
+#%%
 class PhysicsInformedNN:
     # Initialize the class
     def __init__(self, x, y, t, u, v, layers):
@@ -204,7 +205,7 @@ def axisEqual3D(ax):
     for ctr, dim in zip(centers, 'xyz'):
         getattr(ax, 'set_{}lim'.format(dim))(ctr - r, ctr + r)
         
-        
+#%%        
 if __name__ == "__main__": 
       
     N_train = 5000
@@ -239,8 +240,9 @@ if __name__ == "__main__":
     v = VV.flatten()[:,None] # NT x 1
     p = PP.flatten()[:,None] # NT x 1
     
+    #%%
     ######################################################################
-    ######################## Noiseles Data ###############################
+    ######################## Noiseless Data ###############################
     ######################################################################
     # Training Data    
     idx = np.random.choice(N*T, N_train, replace=False)
@@ -303,7 +305,7 @@ if __name__ == "__main__":
     PP_star = griddata(X_star, p_pred.flatten(), (X, Y), method='cubic')
     P_exact = griddata(X_star, p_star.flatten(), (X, Y), method='cubic')
     
-    
+    #%%
     ######################################################################
     ########################### Noisy Data ###############################
     ######################################################################
@@ -325,7 +327,7 @@ if __name__ == "__main__":
     print('Error l2: %.5f%%' % (error_lambda_2_noisy))     
 
              
-    
+    #%%
     ######################################################################
     ############################# Plotting ###############################
     ######################################################################    
